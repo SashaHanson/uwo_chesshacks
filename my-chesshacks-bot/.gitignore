@@ -6,3 +6,17 @@ venv
 devtools
 .env.local
 devtools/.env.local
+/venv/
+/.venv/
+/modal_env/
+__pycache__/
+*.pyc
+*.pt
+*.npy
+*.pkl
+*.log
+*.tmp
+node_modules/
+dist/
+build/
+.env
