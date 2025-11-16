@@ -17,6 +17,4 @@ typing_extensions==4.15.0
 uvicorn==0.38.0
 
 numpy==2.3.4
-fastapi==0.111.0
-python-chess==1.999
 torch==2.9.1
