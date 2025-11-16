@@ -2,6 +2,7 @@ import modal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 app = modal.App("chess-train")
 
@@ -18,12 +19,13 @@ image = (
     .add_local_dir(local_path=TRAINING_LOCAL, remote_path=TRAINING_REMOTE)
 )
 
-GPU_CONFIG = "L40S"
+#GPU_CONFIG = "L40S"
+
 
 
 @app.function(
     image=image,
-    gpu=GPU_CONFIG,
+    gpu=modal.gpu.H100(count=2)
     timeout=80000,
     volumes={"/root/vol": vol},
     max_containers=10,
@@ -36,9 +38,20 @@ def train_model():
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.utils.data import TensorDataset, DataLoader
-    from tqdm import tqdm
-    #from torch.amp import autocast, GradScaler
     from torch.cuda.amp import autocast, GradScaler
+    from tqdm import tqdm
+
+    # -----------------------------
+    # HYPERPARAMETERS
+    # -----------------------------
+    BATCH_SIZE = 2048
+    EPOCHS = 30                      # was 10 – more training for stronger weights
+    BASE_LR = 1e-3
+    MIN_LR = 1e-5
+    WEIGHT_DECAY = 1e-4
+    VALUE_LOSS_WEIGHT = 0.5          # weight for value loss relative to policy loss
+    LABEL_SMOOTHING = 0.1
+    MAX_GRAD_NORM = 1.0
 
     # --------------------------------------
     # Load dataset
@@ -79,10 +92,10 @@ def train_model():
     Y_value = torch.tensor(Y_value, dtype=torch.float32)
 
     dataset = TensorDataset(X, Y_policy, Y_value)
-    loader = DataLoader(dataset, batch_size=2048, shuffle=True)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
     # ============================
-    # MODEL DEFINITION
+    # MODEL DEFINITION (unchanged)
     # ============================
 
     class ResidualBlock(nn.Module):
@@ -153,29 +166,33 @@ def train_model():
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=1e-3,
+        lr=BASE_LR,
+        weight_decay=WEIGHT_DECAY,
         fused=True
     )
 
-    policy_loss_fn = nn.CrossEntropyLoss()
+    # policy + value losses
+    policy_loss_fn = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     value_loss_fn = nn.MSELoss()
+
     scaler = GradScaler()
 
+    # cosine LR schedule over epochs
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=MIN_LR)
 
     # -----------------------------
     # TRAIN LOOP
     # -----------------------------
-    EPOCHS = 10
-
     for epoch in range(EPOCHS):
+        model.train()
         total_policy_loss = 0.0
         total_value_loss = 0.0
 
-        for xb, ypb, yvb in tqdm(loader, desc=f"Epoch {epoch}"):
+        for xb, ypb, yvb in tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
 
-            xb = xb.to(device)
-            ypb = ypb.to(device)
-            yvb = yvb.to(device)
+            xb = xb.to(device, non_blocking=True)
+            ypb = ypb.to(device, non_blocking=True)
+            yvb = yvb.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -185,19 +202,31 @@ def train_model():
 
                 loss_p = policy_loss_fn(policy_logits, ypb)
                 loss_v = value_loss_fn(value_pred, yvb)
-                loss = loss_p + loss_v
+                loss = loss_p + VALUE_LOSS_WEIGHT * loss_v
 
             scaler.scale(loss).backward()
+
+            # gradient clipping with AMP: unscale then clip
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+
             scaler.step(optimizer)
             scaler.update()
 
             total_policy_loss += loss_p.item()
             total_value_loss += loss_v.item()
 
+        scheduler.step()
+
+        avg_policy_loss = total_policy_loss / len(loader)
+        avg_value_loss = total_value_loss / len(loader)
+        current_lr = scheduler.get_last_lr()[0]
+
         print(
-            f"Epoch {epoch} | "
-            f"Policy Loss: {total_policy_loss:.4f} | "
-            f"Value Loss: {total_value_loss:.4f}"
+            f"Epoch {epoch+1}/{EPOCHS} | "
+            f"LR: {current_lr:.6f} | "
+            f"Policy Loss: {avg_policy_loss:.4f} | "
+            f"Value Loss: {avg_value_loss:.4f}"
         )
 
     # -----------------------------
